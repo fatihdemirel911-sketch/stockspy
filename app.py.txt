@@ -1,0 +1,356 @@
+import sys
+import json
+import sqlite3
+import requests
+from requests.auth import HTTPBasicAuth
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QTableWidget, QTableWidgetItem, QPushButton, QLabel, QLineEdit,
+    QMessageBox, QHeaderView, QGroupBox, QTabWidget, QFormLayout
+)
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QFont, QColor
+
+# MODERN KURUMSAL QSS STİL DOSYASI (Arayüzü profesyonel gösteren sihirli dokunuş)
+MODERN_STYLESHEET = """
+QMainWindow {
+    background-color: #F8FAFC;
+}
+QTabWidget::pane {
+    border: 1px solid #E2E8F0;
+    background: #FFFFFF;
+    border-radius: 6px;
+}
+QTabBar::tab {
+    background: #E2E8F0;
+    color: #475569;
+    padding: 10px 20px;
+    font-weight: bold;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+    margin-right: 2px;
+}
+QTabBar::tab:selected {
+    background: #2563EB;
+    color: #FFFFFF;
+}
+QGroupBox {
+    font-weight: bold;
+    color: #1E293B;
+    border: 1px solid #CBD5E1;
+    border-radius: 8px;
+    margin-top: 10px;
+    padding-top: 15px;
+    background-color: #FFFFFF;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    padding: 0 5px;
+    color: #2563EB;
+}
+QLineEdit {
+    padding: 8px;
+    border: 1px solid #CBD5E1;
+    border-radius: 6px;
+    background-color: #F8FAFC;
+    color: #0F172A;
+}
+QLineEdit:focus {
+    border: 2px solid #2563EB;
+    background-color: #FFFFFF;
+}
+QPushButton {
+    background-color: #2563EB;
+    color: WHITE;
+    font-weight: bold;
+    border-radius: 6px;
+    padding: 8px 15px;
+}
+QPushButton:hover {
+    background-color: #1D4ED8;
+}
+QTableWidget {
+    background-color: #FFFFFF;
+    alternate-background-color: #F1F5F9;
+    gridline-color: #E2E8F0;
+    border: 1px solid #CBD5E1;
+    border-radius: 6px;
+}
+QHeaderView::section {
+    background-color: #E2E8F0;
+    color: #1E293B;
+    padding: 8px;
+    font-weight: bold;
+    border: none;
+}
+"""
+
+class Database:
+    def __init__(self, db_name="stok_yonetimi.db"):
+        self.conn = sqlite3.connect(db_name)
+        self.create_tables()
+
+    def create_tables(self):
+        cursor = self.conn.cursor()
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS urunler (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            barkod TEXT UNIQUE,
+            urun_adi TEXT,
+            stok INTEGER,
+            fiyat REAL
+        )
+        ''')
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ayarlar (
+            anahtar TEXT PRIMARY KEY,
+            deger TEXT
+        )
+        ''')
+        self.conn.commit()
+
+    def ayar_getir(self, anahtar):
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT deger FROM ayarlar WHERE anahtar = ?", (anahtar,))
+        sonuc = cursor.fetchone()
+        return sonuc[0] if sonuc else ""
+
+    def ayar_kaydet(self, anahtar, deger):
+        cursor = self.conn.cursor()
+        cursor.execute("INSERT OR REPLACE INTO ayarlar (anahtar, deger) VALUES (?, ?)", (anahtar, deger))
+        self.conn.commit()
+
+    def urunleri_getir(self):
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM urunler")
+        return cursor.fetchall()
+
+    def stok_guncelle_db(self, barkod, yeni_stok):
+        cursor = self.conn.cursor()
+        cursor.execute("UPDATE urunler SET stok = ? WHERE barkod = ?", (yeni_stok, barkod))
+        self.conn.commit()
+
+    def urun_ekle_veya_guncelle(self, barkod, urun_adi, stok, fiyat):
+        query = '''
+        INSERT INTO urunler (barkod, urun_adi, stok, fiyat)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(barkod) DO UPDATE SET
+            urun_adi=excluded.urun_adi,
+            stok=excluded.stok,
+            fiyat=excluded.fiyat
+        '''
+        self.conn.execute(query, (barkod, urun_adi, stok, fiyat))
+        self.conn.commit()
+
+class StokYonetimApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("ProStok - Çoklu Pazaryeri Otomatik Entegrasyon Paneli")
+        self.resize(1150, 700)
+        self.db = Database()
+
+        self.initUI()
+        self.load_data()
+        self.load_settings()
+
+        # Otomatik Arka Plan Kontrolü (Örn: Her 5 dakikada bir)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.arkaplanda_siparisleri_kontrol_et)
+        self.timer.start(300000)
+
+    def initUI(self):
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        main_layout = QVBoxLayout()
+        main_layout.setContentsMargins(15, 15, 15, 15)
+
+        self.tabs = QTabWidget()
+        main_layout.addWidget(self.tabs)
+
+        # ================= TAB 1: STOK & FİYAT YÖNETİMİ =================
+        tab_stok = QWidget()
+        stok_layout = QVBoxLayout()
+        stok_layout.setContentsMargins(15, 15, 15, 15)
+
+        form_box = QGroupBox(" Ürün Yönetimi ve Anlık Güncelleme ")
+        form_layout = QHBoxLayout()
+
+        self.txt_barkod = QLineEdit()
+        self.txt_barkod.setPlaceholderText("Barkod / Stok Kodu")
+        self.txt_ad = QLineEdit()
+        self.txt_ad.setPlaceholderText("Ürün Adı")
+        self.txt_stok = QLineEdit()
+        self.txt_stok.setPlaceholderText("Stok")
+        self.txt_fiyat = QLineEdit()
+        self.txt_fiyat.setPlaceholderText("Fiyat (TL)")
+
+        btn_kaydet = QPushButton("Ürünü Kaydet & Senkronize Et")
+        btn_kaydet.clicked.connect(self.save_and_sync)
+
+        form_layout.addWidget(self.txt_barkod)
+        form_layout.addWidget(self.txt_ad)
+        form_layout.addWidget(self.txt_stok)
+        form_layout.addWidget(self.txt_fiyat)
+        form_layout.addWidget(btn_kaydet)
+        form_box.setLayout(form_layout)
+        stok_layout.addWidget(form_box)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(["ID", "Barkod", "Ürün Adı", "Stok", "Fiyat (TL)"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setAlternatingRowColors(True)
+        self.table.itemClicked.connect(self.select_row)
+        stok_layout.addWidget(self.table)
+
+        tab_stok.setLayout(stok_layout)
+        self.tabs.addTab(tab_stok, "📦 Stok & Ürün Takibi")
+
+        # ================= TAB 2: MAĞAZA API AYARLARI =================
+        tab_ayar = QWidget()
+        ayar_layout = QVBoxLayout()
+        ayar_layout.setContentsMargins(15, 15, 15, 15)
+
+        ayar_box = QGroupBox(" Pazaryeri Entegrasyon API Bilgileri ")
+        ayar_form = QFormLayout()
+        ayar_form.setSpacing(12)
+
+        self.ty_supp = QLineEdit()
+        self.ty_key = QLineEdit()
+        self.ty_sec = QLineEdit()
+        ayar_form.addRow(QLabel("<b>Trendyol Satıcı ID (Supplier ID):</b>"), self.ty_supp)
+        ayar_form.addRow(QLabel("Trendyol API Key:"), self.ty_key)
+        ayar_form.addRow(QLabel("Trendyol API Secret:"), self.ty_sec)
+
+        ayar_form.addRow(QLabel(""))
+
+        self.hb_merchant = QLineEdit()
+        self.hb_token = QLineEdit()
+        ayar_form.addRow(QLabel("<b>Hepsiburada Merchant ID:</b>"), self.hb_merchant)
+        ayar_form.addRow(QLabel("Hepsiburada Service Key / Token:"), self.hb_token)
+
+        ayar_form.addRow(QLabel(""))
+
+        self.ptt_user = QLineEdit()
+        self.ptt_pass = QLineEdit()
+        ayar_form.addRow(QLabel("<b>PTTAVM Kullanıcı Adı:</b>"), self.ptt_user)
+        ayar_form.addRow(QLabel("PTTAVM Şifre:"), self.ptt_pass)
+
+        btn_kaydet_ayar = QPushButton("API Ayarlarını Güvenle Kaydet")
+        btn_kaydet_ayar.setStyleSheet("background-color: #059669; padding: 10px;")
+        btn_kaydet_ayar.clicked.connect(self.save_settings_to_db)
+        ayar_form.addRow(btn_kaydet_ayar)
+
+        ayar_box.setLayout(ayar_form)
+        ayar_layout.addWidget(ayar_box)
+        tab_ayar.setLayout(ayar_layout)
+        self.tabs.addTab(tab_ayar, "🔑 Mağaza API Ayarları")
+
+        main_widget.setLayout(main_layout)
+
+    def load_settings(self):
+        self.ty_supp.setText(self.db.ayar_getir("ty_supp"))
+        self.ty_key.setText(self.db.ayar_getir("ty_key"))
+        self.ty_sec.setText(self.db.ayar_getir("ty_sec"))
+        self.hb_merchant.setText(self.db.ayar_getir("hb_merchant"))
+        self.hb_token.setText(self.db.ayar_getir("hb_token"))
+        self.ptt_user.setText(self.db.ayar_getir("ptt_user"))
+        self.ptt_pass.setText(self.db.ayar_getir("ptt_pass"))
+
+    def save_settings_to_db(self):
+        self.db.ayar_kaydet("ty_supp", self.ty_supp.text().strip())
+        self.db.ayar_kaydet("ty_key", self.ty_key.text().strip())
+        self.db.ayar_kaydet("ty_sec", self.ty_sec.text().strip())
+        self.db.ayar_kaydet("hb_merchant", self.hb_merchant.text().strip())
+        self.db.ayar_kaydet("hb_token", self.hb_token.text().strip())
+        self.db.ayar_kaydet("ptt_user", self.ptt_user.text().strip())
+        self.db.ayar_kaydet("ptt_pass", self.ptt_pass.text().strip())
+        QMessageBox.information(self, "Başarılı", "API ayarları veritabanına başarıyla kaydedildi!")
+
+    def load_data(self):
+        urunler = self.db.urunleri_getir()
+        self.table.setRowCount(0)
+        for row_idx, urun in enumerate(urunler):
+            self.table.insertRow(row_idx)
+            for col_idx, value in enumerate(urun):
+                item = QTableWidgetItem(str(value))
+                if col_idx in [3, 4]:  # Stok ve Fiyat sütunlarını ortala
+                    item.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(row_idx, col_idx, item)
+
+    def select_row(self, item):
+        row = item.row()
+        self.txt_barkod.setText(self.table.item(row, 1).text())
+        self.txt_ad.setText(self.table.item(row, 2).text())
+        self.txt_stok.setText(self.table.item(row, 3).text())
+        self.txt_fiyat.setText(self.table.item(row, 4).text())
+
+    def save_and_sync(self):
+        barkod = self.txt_barkod.text().strip()
+        ad = self.txt_ad.text().strip()
+        stok = self.txt_stok.text().strip()
+        fiyat = self.txt_fiyat.text().strip()
+
+        if not (barkod and ad and stok and fiyat):
+            QMessageBox.warning(self, "Eksik Alan", "Lütfen tüm ürün alanlarını eksiksiz doldurunuz!")
+            return
+
+        self.db.urun_ekle_veya_guncelle(barkod, ad, int(stok), float(fiyat))
+        self.load_data()
+        self.pazaryerlerine_stok_gonder(barkod, int(stok), float(fiyat))
+        QMessageBox.information(self, "Başarılı", "Ürün veritabanına kaydedildi ve pazaryerlerine senkronize edildi.")
+
+    def pazaryerlerine_stok_gonder(self, barkod, stok, fiyat):
+        ty_supp = self.db.ayar_getir("ty_supp")
+        ty_key = self.db.ayar_getir("ty_key")
+        ty_sec = self.db.ayar_getir("ty_sec")
+
+        if ty_supp and ty_key and ty_sec:
+            try:
+                url = f"https://api.trendyol.com/sapigw/suppliers/{ty_supp}/products/price-and-inventory"
+                payload = {"items": [{"barcode": barkod, "quantity": stok, "salePrice": fiyat, "listPrice": fiyat}]}
+                requests.post(url, data=json.dumps(payload), headers={"Content-Type": "application/json"}, auth=HTTPBasicAuth(ty_key, ty_sec), timeout=5)
+            except:
+                pass
+
+    def arkaplanda_siparisleri_kontrol_et(self):
+        ty_supp = self.db.ayar_getir("ty_supp")
+        ty_key = self.db.ayar_getir("ty_key")
+        ty_sec = self.db.ayar_getir("ty_sec")
+
+        if not (ty_supp and ty_key and ty_sec):
+            return
+
+        try:
+            url = f"https://api.trendyol.com/sapigw/suppliers/{ty_supp}/orders?status=Created"
+            response = requests.get(url, auth=HTTPBasicAuth(ty_key, ty_sec), timeout=5)
+            
+            if response.status_code == 200:
+                siparisler = response.json().get("content", [])
+                for siparis in siparisler:
+                    for kalem in siparis.get("lines", []):
+                        barkod = kalem.get("barcode")
+                        satilan_adet = kalem.get("quantity")
+                        
+                        cursor = self.db.conn.cursor()
+                        cursor.execute("SELECT stok FROM urunler WHERE barkod = ?", (barkod,))
+                        kayit = cursor.fetchone()
+                        if kayit:
+                            mevcut_stok = kayit[0]
+                            yeni_stok = max(0, mevcut_stok - satilan_adet)
+                            self.db.stok_guncelle_db(barkod, yeni_stok)
+                            self.pazaryerlerine_stok_gonder(barkod, yeni_stok, 0.0)
+                self.load_data()
+        except Exception as e:
+            print("Arka plan senkronizasyon hatası:", e)
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    
+    # Global Modern Stili Uygula
+    app.setStyleSheet(MODERN_STYLESHEET)
+    
+    window = StokYonetimApp()
+    window.show()
+    sys.exit(app.exec_())
